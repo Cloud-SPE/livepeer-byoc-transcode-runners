@@ -1,0 +1,391 @@
+services:
+  orchestrator:
+    image: livepeer/go-livepeer:latest
+    container_name: byoc-orchestrator
+    volumes:
+      - ./data/orchestrator:/root/.lpData
+    command: >
+      -config=/root/.lpData/orch.conf
+
+
+  gateway:
+    image: livepeer/go-livepeer:latest
+    container_name: byoc-gateway
+    volumes:
+      - ./data/gateway:/root/.lpData
+    ports:
+      - 8935:8935
+    command: >
+      -config=/root/.lpData/gateway.conf
+    depends_on:
+      - orchestrator
+
+  openai_gateway_proxy:
+    image: registry.livepeer.tools/livepeer-byoc-gateway-proxy:v0.0.8
+    container_name: openai_gateway_proxy
+    environment:
+      - PROXY_ADDR=:8090
+      - GATEWAY_URL=http://gateway:8935
+      - CHAT_COMPLETIONS_CAPABILITY=openai-chat-completions
+      - IMAGE_GENERATION_CAPABILITY=openai-image-generation
+      - TEXT_EMBEDDINGS_CAPABILITY=openai-text-embeddings
+      - RERANK_CAPABILITY=cohere-rerank
+      - VIDEO_GENERATION_CAPABILITY=video-generation
+      - CHAT_COMPLETIONS_TIMEOUT_SECONDS=120
+      - IMAGE_GENERATION_TIMEOUT_SECONDS=120
+      - TEXT_EMBEDDINGS_TIMEOUT_SECONDS=30
+      - RERANK_TIMEOUT_SECONDS=30
+      - VIDEO_GENERATION_TIMEOUT_SECONDS=900
+    depends_on:
+      - gateway
+    ports:
+      - "8090:8090"
+
+  # BYOC transcode runner: GPU-accelerated video transcoding via ffmpeg + NVENC
+  byoc_transcode_runner:
+    build:
+      context: .
+      dockerfile: transcode-runner/Dockerfile
+      target: runtime-nvidia
+      args:
+        REGISTRY: ${REGISTRY}
+        TAG: ${TAG:-latest}
+    container_name: byoc_transcode_runner
+    runtime: nvidia
+    environment:
+      - RUNNER_ADDR=:8080
+      - MAX_QUEUE_SIZE=3
+      - TEMP_DIR=/tmp/transcode
+      - JOB_TTL_SECONDS=3600
+    volumes:
+      - transcode-temp:/tmp/transcode
+    depends_on:
+      - orchestrator
+
+  # BYOC ABR runner: GPU-accelerated multi-rendition ABR transcoding via ffmpeg + NVENC
+  byoc_abr_runner:
+    build:
+      context: .
+      dockerfile: abr-runner/Dockerfile
+      target: runtime-nvidia
+      args:
+        REGISTRY: ${REGISTRY}
+        TAG: ${TAG:-latest}
+    container_name: byoc_abr_runner
+    runtime: nvidia
+    environment:
+      - RUNNER_ADDR=:8080
+      - MAX_QUEUE_SIZE=2
+      - TEMP_DIR=/tmp/abr
+      - JOB_TTL_SECONDS=3600
+    volumes:
+      - abr-temp:/tmp/abr
+    depends_on:
+      - orchestrator
+
+  # BYOC live transcode runner: GPU-accelerated live transcoding via ffmpeg + NVENC + Trickle
+  byoc_live_transcode_runner:
+    build:
+      context: .
+      dockerfile: live-transcode-runner/Dockerfile
+      target: runtime-nvidia
+      args:
+        REGISTRY: ${REGISTRY}
+        TAG: ${TAG:-latest}
+    container_name: byoc_live_transcode_runner
+    runtime: nvidia
+    environment:
+      - RUNNER_ADDR=:8080
+      - MAX_STREAMS=0
+      - RESTART_LIMIT=3
+    depends_on:
+      - orchestrator
+
+  # Register video transcode capability
+  register_transcode_capability:
+    image: ${REGISTRY}/livepeer-byoc-register-capability:v0.0.8
+    container_name: register_transcode_capability
+    environment:
+      - ORCH_URL=https://orchestrator:8935
+      - ORCH_SECRET=orch-secret
+      - CAPABILITY_NAME=video-transcode
+      - CAPABILITY_URL=http://byoc_transcode_runner:8080
+      - PRICE_PER_UNIT=100
+      - CAPACITY=3
+      - RETRIES=30
+      - RETRY_DELAY_SECONDS=3
+      - PERIODIC_REGISTRATION_ENABLED=true
+      - PERIODIC_REGISTRATION_INTERVAL_SECONDS=60
+      - PERIODIC_REGISTRATION_RETRIES=3
+      - PERIODIC_REGISTRATION_RETRY_DELAY_SECONDS=2
+      - UNREGISTER_ON_SHUTDOWN=true
+    depends_on:
+      - byoc_transcode_runner
+
+  # Register ABR transcode capability
+  register_abr_capability:
+    image: ${REGISTRY}/livepeer-byoc-register-capability:v0.0.8
+    container_name: register_abr_capability
+    environment:
+      - ORCH_URL=https://orchestrator:8935
+      - ORCH_SECRET=orch-secret
+      - CAPABILITY_NAME=transcode-abr
+      - CAPABILITY_URL=http://byoc_abr_runner:8080
+      - PRICE_PER_UNIT=200
+      - CAPACITY=2
+      - RETRIES=30
+      - RETRY_DELAY_SECONDS=3
+      - PERIODIC_REGISTRATION_ENABLED=true
+      - PERIODIC_REGISTRATION_INTERVAL_SECONDS=60
+      - PERIODIC_REGISTRATION_RETRIES=3
+      - PERIODIC_REGISTRATION_RETRY_DELAY_SECONDS=2
+      - UNREGISTER_ON_SHUTDOWN=true
+    depends_on:
+      - byoc_abr_runner
+
+  # Register live transcode capability
+  register_live_transcode_capability:
+    image: ${REGISTRY}/livepeer-byoc-register-capability:v0.0.8
+    container_name: register_live_transcode_capability
+    environment:
+      - ORCH_URL=https://orchestrator:8935
+      - ORCH_SECRET=orch-secret
+      - CAPABILITY_NAME=transcode-live
+      - CAPABILITY_URL=http://byoc_live_transcode_runner:8080
+      - PRICE_PER_UNIT=150
+      - CAPACITY=3
+      - RETRIES=30
+      - RETRY_DELAY_SECONDS=3
+      - PERIODIC_REGISTRATION_ENABLED=true
+      - PERIODIC_REGISTRATION_INTERVAL_SECONDS=60
+      - PERIODIC_REGISTRATION_RETRIES=3
+      - PERIODIC_REGISTRATION_RETRY_DELAY_SECONDS=2
+      - UNREGISTER_ON_SHUTDOWN=true
+    depends_on:
+      - byoc_live_transcode_runner
+
+  # ─── Intel GPU services ───────────────────────────────────────────────
+
+  # BYOC transcode runner (Intel QSV)
+  byoc_transcode_runner_intel:
+    build:
+      context: .
+      dockerfile: transcode-runner/Dockerfile
+      target: runtime-intel
+      args:
+        REGISTRY: ${REGISTRY}
+        TAG: ${TAG:-latest}
+    container_name: byoc_transcode_runner_intel
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      - RUNNER_ADDR=:8080
+      - MAX_QUEUE_SIZE=3
+      - TEMP_DIR=/tmp/transcode
+      - JOB_TTL_SECONDS=3600
+    volumes:
+      - transcode-temp:/tmp/transcode
+    depends_on:
+      - orchestrator
+    profiles:
+      - intel
+
+  # BYOC ABR runner (Intel QSV)
+  byoc_abr_runner_intel:
+    build:
+      context: .
+      dockerfile: abr-runner/Dockerfile
+      target: runtime-intel
+      args:
+        REGISTRY: ${REGISTRY}
+        TAG: ${TAG:-latest}
+    container_name: byoc_abr_runner_intel
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      - RUNNER_ADDR=:8080
+      - MAX_QUEUE_SIZE=2
+      - TEMP_DIR=/tmp/abr
+      - JOB_TTL_SECONDS=3600
+    volumes:
+      - abr-temp:/tmp/abr
+    depends_on:
+      - orchestrator
+    profiles:
+      - intel
+
+  # Register transcode capability (Intel)
+  register_transcode_capability_intel:
+    image: ${REGISTRY}/livepeer-byoc-register-capability:v0.0.8
+    container_name: register_transcode_capability_intel
+    environment:
+      - ORCH_URL=https://orchestrator:8935
+      - ORCH_SECRET=orch-secret
+      - CAPABILITY_NAME=video-transcode
+      - CAPABILITY_URL=http://byoc_transcode_runner_intel:8080
+      - PRICE_PER_UNIT=100
+      - CAPACITY=3
+      - RETRIES=30
+      - RETRY_DELAY_SECONDS=3
+      - PERIODIC_REGISTRATION_ENABLED=true
+      - PERIODIC_REGISTRATION_INTERVAL_SECONDS=60
+      - PERIODIC_REGISTRATION_RETRIES=3
+      - PERIODIC_REGISTRATION_RETRY_DELAY_SECONDS=2
+      - UNREGISTER_ON_SHUTDOWN=true
+    depends_on:
+      - byoc_transcode_runner_intel
+    profiles:
+      - intel
+
+  # Register ABR capability (Intel)
+  register_abr_capability_intel:
+    image: ${REGISTRY}/livepeer-byoc-register-capability:v0.0.8
+    container_name: register_abr_capability_intel
+    environment:
+      - ORCH_URL=https://orchestrator:8935
+      - ORCH_SECRET=orch-secret
+      - CAPABILITY_NAME=transcode-abr
+      - CAPABILITY_URL=http://byoc_abr_runner_intel:8080
+      - PRICE_PER_UNIT=200
+      - CAPACITY=2
+      - RETRIES=30
+      - RETRY_DELAY_SECONDS=3
+      - PERIODIC_REGISTRATION_ENABLED=true
+      - PERIODIC_REGISTRATION_INTERVAL_SECONDS=60
+      - PERIODIC_REGISTRATION_RETRIES=3
+      - PERIODIC_REGISTRATION_RETRY_DELAY_SECONDS=2
+      - UNREGISTER_ON_SHUTDOWN=true
+    depends_on:
+      - byoc_abr_runner_intel
+    profiles:
+      - intel
+
+  # ─── AMD GPU services ─────────────────────────────────────────────────
+
+  # BYOC transcode runner (AMD VAAPI)
+  byoc_transcode_runner_amd:
+    build:
+      context: .
+      dockerfile: transcode-runner/Dockerfile
+      target: runtime-amd
+      args:
+        REGISTRY: ${REGISTRY}
+        TAG: ${TAG:-latest}
+    container_name: byoc_transcode_runner_amd
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      - RUNNER_ADDR=:8080
+      - MAX_QUEUE_SIZE=3
+      - TEMP_DIR=/tmp/transcode
+      - JOB_TTL_SECONDS=3600
+    volumes:
+      - transcode-temp:/tmp/transcode
+    depends_on:
+      - orchestrator
+    profiles:
+      - amd
+
+  # BYOC ABR runner (AMD VAAPI)
+  byoc_abr_runner_amd:
+    build:
+      context: .
+      dockerfile: abr-runner/Dockerfile
+      target: runtime-amd
+      args:
+        REGISTRY: ${REGISTRY}
+        TAG: ${TAG:-latest}
+    container_name: byoc_abr_runner_amd
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      - RUNNER_ADDR=:8080
+      - MAX_QUEUE_SIZE=2
+      - TEMP_DIR=/tmp/abr
+      - JOB_TTL_SECONDS=3600
+    volumes:
+      - abr-temp:/tmp/abr
+    depends_on:
+      - orchestrator
+    profiles:
+      - amd
+
+  # Register transcode capability (AMD)
+  register_transcode_capability_amd:
+    image: ${REGISTRY}/livepeer-byoc-register-capability:v0.0.8
+    container_name: register_transcode_capability_amd
+    environment:
+      - ORCH_URL=https://orchestrator:8935
+      - ORCH_SECRET=orch-secret
+      - CAPABILITY_NAME=video-transcode
+      - CAPABILITY_URL=http://byoc_transcode_runner_amd:8080
+      - PRICE_PER_UNIT=100
+      - CAPACITY=3
+      - RETRIES=30
+      - RETRY_DELAY_SECONDS=3
+      - PERIODIC_REGISTRATION_ENABLED=true
+      - PERIODIC_REGISTRATION_INTERVAL_SECONDS=60
+      - PERIODIC_REGISTRATION_RETRIES=3
+      - PERIODIC_REGISTRATION_RETRY_DELAY_SECONDS=2
+      - UNREGISTER_ON_SHUTDOWN=true
+    depends_on:
+      - byoc_transcode_runner_amd
+    profiles:
+      - amd
+
+  # Register ABR capability (AMD)
+  register_abr_capability_amd:
+    image: ${REGISTRY}/livepeer-byoc-register-capability:v0.0.8
+    container_name: register_abr_capability_amd
+    environment:
+      - ORCH_URL=https://orchestrator:8935
+      - ORCH_SECRET=orch-secret
+      - CAPABILITY_NAME=transcode-abr
+      - CAPABILITY_URL=http://byoc_abr_runner_amd:8080
+      - PRICE_PER_UNIT=200
+      - CAPACITY=2
+      - RETRIES=30
+      - RETRY_DELAY_SECONDS=3
+      - PERIODIC_REGISTRATION_ENABLED=true
+      - PERIODIC_REGISTRATION_INTERVAL_SECONDS=60
+      - PERIODIC_REGISTRATION_RETRIES=3
+      - PERIODIC_REGISTRATION_RETRY_DELAY_SECONDS=2
+      - UNREGISTER_ON_SHUTDOWN=true
+    depends_on:
+      - byoc_abr_runner_amd
+    profiles:
+      - amd
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minio4dmin
+      - MINIO_ROOT_PASSWORD=minio4dmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3 &&
+      mc alias set local http://minio:9000 minio4dmin minio4dmin &&
+      mc mb --ignore-existing local/transcoded &&
+      mc anonymous set public local/transcoded
+      "
+
+volumes:
+  abr-temp:
+  transcode-temp:
+  minio-data:
+networks:
+  default:
+    name: byoc_livepeer_network
